@@ -182,3 +182,32 @@ If none of this helps within 30 minutes, escalate to the QuickNotes owner and po
 **f) Symptom vs cause.** A cause alert would be e.g. "QuickNotes container restarted" or "disk usage of the data volume > 90%". It's worse for on-call because it doesn't say whether users are affected (a restart may be invisible to users; a full disk may not matter yet), and it misses causes you didn't think of. The error-rate alert fires on what users actually feel, whatever the cause.
 
 **g) Alert-fatigue threshold.** I'd call this alert too noisy if **more than 30% of its firings in a month** turn out to be "no real user impact" (e.g. a single scanner hitting random URLs, a test script), **or if it fires more than ~2 times a week**. Then I'd tune it: exclude 404s from bots, raise the threshold, or switch to an SLO burn-rate alert.
+
+---
+
+## Bonus — Synthetic monitoring from 2 regions
+
+**Setup:** public URL via `cloudflared tunnel --url http://localhost:8080` → `https://function-docs-iron-makers.trycloudflare.com`.
+Checkly **API check** `QuickNotes health`: `GET /health`, assertion `status == 200`, fail if response > 2000 ms, every **1 min** from **Frankfurt + Singapore**. Ran **19:45 → 20:16 (MSK), 31 min**, ~60 runs.
+
+![Checkly — 1 hour view](lab8-checkly.png)
+
+| Metric | Prometheus (internal) | Checkly (external, 2 regions) |
+|---|---|---|
+| p50 latency | **1.3 ms** | **280 ms** |
+| p95 latency | **2.1 ms** | **1.15 s** |
+| Error count (30 min) | **0** 4xx/5xx | **0** failed runs (availability 100%) |
+
+Internal values: `quantile_over_time(0.5 / 0.95, scrape_duration_seconds{job="quicknotes"}[30m])` and `sum(increase(quicknotes_http_responses_by_code_total{code=~"4..|5.."}[30m]))`.
+Frankfurt runs were ~135–250 ms, Singapore ~260 ms – 1.13 s (some marked *degraded*, but all passed). Almost all of the external time is network: Checkly's timing shows DNS 7 ms, TCP 1 ms, **first byte ~250 ms** — the trip through Cloudflare to my laptop and back, while the app itself answers in ~2 ms.
+
+**Real example right after the window:** at ~20:16 the checks started **failing from both regions at once** (with retries), while Prometheus inside Docker still reported the target `"up"`:
+
+```text
+$ curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[].health'
+"up"
+```
+
+![Checkly failures while Prometheus says up](lab8-checkly-fail.png)
+
+**Failure-mode analysis.** Checkly sees the service the way a user does, so it catches everything *between* the user and the app: DNS problems, an expired TLS cert, a broken tunnel/load balancer/CDN, a regional network issue, or the whole host being offline — exactly what happened at 20:16, when the quick tunnel stopped answering but the app and Prometheus were fine. Prometheus can't see any of that, because it sits next to the app on the same Docker network (and if the whole host dies, Prometheus dies with it and goes silent instead of alerting). On the other hand, Prometheus sees the *inside*: the error ratio of all real traffic, which endpoints/codes fail, the number of stored notes (saturation), and sub-millisecond latency changes that are invisible in a 250 ms network round-trip. External `/health` probes only test one cheap endpoint once a minute, so they would miss a 5% error rate on `POST /notes` that Prometheus alerts on. You need both: Prometheus for "why is it broken", synthetic checks for "can users reach it at all".
