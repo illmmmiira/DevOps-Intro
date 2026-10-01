@@ -10,7 +10,7 @@
     data_dir: /var/lib/quicknotes
     data_path: "{{ data_dir }}/notes.json"
     seed_path: "{{ data_dir }}/seed.json"
-    restart_sec: 3
+    restart_sec: 10
 
   tasks:
     - name: Create quicknotes system user
