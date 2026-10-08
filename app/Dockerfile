@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---------- Stage 1: build ----------
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 WORKDIR /src
 
 # Dependencies first: this layer is reused until go.mod/go.sum change
