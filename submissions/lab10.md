@@ -193,17 +193,38 @@ $ for i in 1 2 3 4 5; do curl -s -o /dev/null -w '%{time_total}\n' $URL/health; 
 
 **Warm p50 = 493 ms** (sorted: 410, 463, **493**, 494, 518). Measured from Russia; each `curl` opens a new TLS connection to Cloudflare's Frankfurt edge (`cf-ray …-FRA`).
 
-TBD_RENDER_HYPERFINE
+Larger sample (50 runs, `hyperfine -N --warmup 5`, 01:05 after cold #3):
+
+```
+Render: n=50 p50=207ms p95=286ms min=179ms max=291ms   (mean 225 ± 38 ms)
+```
+
+The 5-request sample (≈ 493 ms) and the 50-run sample (207 ms) were taken ~2 h apart with a VPN in a different state on the laptop, which changes the route to Frankfurt — the network path, not the service, sets the number.
 
 ### Cold latency (after ≥ 15 min idle → spin-down)
 
 | # | Time (MSK) | Result |
 |---|---|---|
-| 1 | 23:48 | first request: `HTTP 000` after **29.98 s** (connection dropped mid-wake); next request immediately `200` → wake took **≥ 30 s** |
-| 2 | TBD_COLD2_TIME | TBD_COLD2 |
-| 3 | TBD_COLD3_TIME | TBD_COLD3 |
+| 1 | 23:48 | ❌ not usable — first request `HTTP 000` after 29.98 s, the laptop's **VPN** dropped the connection; the retry right after got `200` |
+| 1b | 00:26 | **12.7 s** → `HTTP 200` (measured from a cloud machine on another network while troubleshooting the VPN; the laptop's requests weren't reaching Render, so the service was still asleep) |
+| 2 | 00:49 | **12.5 s** → `HTTP 200` (first try) |
+| 3 | 01:05 | **12.5 s** → `HTTP 200` (first try) |
 
-Cold #1 shows a real-world effect: something on the path (client side, ~30 s idle timeout) dropped the connection before Render finished waking the container. For #2 and #3 the measurement retries until the first `200` and reports the total wake time.
+**Cold start ≈ 12.5 s** (three valid samples: 12.7 / 12.5 / 12.5 s), vs warm p50 ≈ 0.2–0.5 s → **~25–60× slower** on the first request after a spin-down.
+
+Measurement (repeat after ≥ 16 min idle; counts retries until the first `200`):
+
+```bash
+until curl -s -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n" --max-time 120 -f $URL/health; do sleep 1; done
+```
+```
+== cold #2 start 00:49:21
+  HTTP 200 in 12.532027s
+== cold #3 start 01:05:34
+  HTTP 200 in 12.451760s
+```
+
+Lesson from #1: between 00:14 and 00:28 every request from the laptop died at exactly ~30 s with `HTTP 000` — `curl` then showed `Resolving timed out` even for google.com. The VPN, not Render, was broken; the service answered fine from another network. Always check the client path before blaming the platform.
 
 ### Note persistence across spin-down
 
@@ -222,7 +243,7 @@ $ curl -s $URL/notes      # after wake → only the 4 seed notes; id 5 is gone
 
 ### Design questions d–f
 
-**d) Why Render's wake is so much slower than Cloud Run's scale-to-zero.** On Render free, spin-down really releases the instance. A wake has to schedule the service on a node, pull/unpack the image (if not cached), start the container, wait for it to bind the port and pass the health check, then route the held request — tens of seconds (we saw ≥ 30 s; Render's banner says "50 seconds or more"). Cloud Run is built around scale-to-zero as the *normal* state: lightweight sandboxes that boot in milliseconds, images pre-staged / lazily streamed, and a request-driven autoscaler, so a small Go binary cold-starts in well under a second to a couple of seconds. Render free optimizes **cost for hobby projects** — idle capacity is reclaimed and the slow wake is part of the "upgrade for always-on" deal. Cloud Run optimizes **per-request elasticity**, billing only for request time while still serving fast.
+**d) Why Render's wake is so much slower than Cloud Run's scale-to-zero.** On Render free, spin-down really releases the instance. A wake has to schedule the service on a node, pull/unpack the image (if not cached), start the container, wait for it to bind the port and pass the health check, then route the held request — tens of seconds (we measured ≈ 12.5 s three times; Render's banner warns of "50 seconds or more"). Cloud Run is built around scale-to-zero as the *normal* state: lightweight sandboxes that boot in milliseconds, images pre-staged / lazily streamed, and a request-driven autoscaler, so a small Go binary cold-starts in well under a second to a couple of seconds. Render free optimizes **cost for hobby projects** — idle capacity is reclaimed and the slow wake is part of the "upgrade for always-on" deal. Cloud Run optimizes **per-request elasticity**, billing only for request time while still serving fast.
 
 **e) Why `PORT` and not `EXPOSE`.** `EXPOSE` is only metadata in the image — not enforced, often missing or wrong, and it can list several ports. The platform owns the router/load balancer, so it *tells* the app where to listen, the same way for every language (the 12-factor / Heroku convention). I set **`PORT=8080`** (so Render routes to 8080) and **`ADDR=:8080`** (QuickNotes' own setting), without touching code. With a mismatch, Render waits, scans for the port the process actually opened, logs `New primary port detected` and **restarts the deploy** — roughly 45 s extra on every bad deploy, a short failed window on first deploy, and confusing logs.
 
@@ -253,18 +274,18 @@ INF SUMMARY: Environment is healthy. cloudflared will use 'quic' as primary prot
 
 **Different network:** opened `https://being-regulatory-argument-goal.trycloudflare.com/health` on a phone with Wi-Fi off (**LTE**) → `{"notes":4,"status":"ok"}` (screenshot, 23:27).
 
-**Benchmark:** `hyperfine -N --warmup 5 --runs 50 "curl -s -o /dev/null <url>/health"`, percentiles from hyperfine's JSON. Both targets measured from the same laptop on the same network so they're comparable; for the tunnel every request leaves the laptop, goes to Cloudflare's edge and comes back down the tunnel — a real Internet round trip, not localhost.
+**Benchmark:** `hyperfine -N --warmup 5 --runs 50 "curl -s -o /dev/null <url>/health"`, percentiles from hyperfine's JSON. Both targets were measured from the same laptop (tunnel at 23:56, Render at 01:05 — the laptop's VPN may have been in a different state, so compare the two with that caveat); for the tunnel every request leaves the laptop, goes to Cloudflare's edge and comes back down the tunnel — a real Internet round trip, not localhost.
 
 ```
 Tunnel: n=50 p50=594ms p95=651ms min=516ms max=786ms   (mean 590 ± 51 ms)
-TBD_RENDER_PCT
+Render: n=50 p50=207ms p95=286ms min=179ms max=291ms   (mean 225 ± 38 ms)
 ```
 
 | | Render (free) | Cloudflare quick tunnel |
 |---|---|---|
-| Warm p50 | TBD_R50 | **594 ms** |
-| Warm p95 | TBD_R95 | **651 ms** |
-| Cold start | TBD_COLD_SUMMARY | N/A — container runs continuously on the laptop |
+| Warm p50 | **207 ms** | **594 ms** |
+| Warm p95 | **286 ms** | **651 ms** |
+| Cold start | **≈ 12.5 s** (12.7 / 12.5 / 12.5 s) | N/A — container runs continuously on the laptop |
 | Public URL stability | stable (`quicknotes-lab10-qodj.onrender.com`) | ephemeral — new random URL on every `cloudflared` restart |
 | Cost | free (750 instance-h/month, sleeps when idle) | free (no account, no uptime guarantee) |
 
