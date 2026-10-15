@@ -1,0 +1,49 @@
+name: nix-repro
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-a:
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # same pin as Lab 3
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - run: nix build .#docker -L
+      - id: digest
+        run: |
+          D=$(sha256sum result | awk '{print $1}')
+          echo "digest=$D" >> "$GITHUB_OUTPUT"
+          echo "build-a digest: $D"
+
+  build-b:
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # same pin as Lab 3
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - run: nix build .#docker -L
+      - id: digest
+        run: |
+          D=$(sha256sum result | awk '{print $1}')
+          echo "digest=$D" >> "$GITHUB_OUTPUT"
+          echo "build-b digest: $D"
+
+  compare:
+    needs: [build-a, build-b]
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          A: ${{ needs.build-a.outputs.digest }}
+          B: ${{ needs.build-b.outputs.digest }}
+        run: |
+          echo "A = $A"
+          echo "B = $B"
+          if [ "$A" = "$B" ]; then echo "REPRODUCIBLE"; else echo "DIGEST MISMATCH"; exit 1; fi
